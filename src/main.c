@@ -1,7 +1,14 @@
-/* vim: set expandtab ts=2 sw=2: */
 /* main.c
 
-Copyright (C) 1999,2000 Tom Gilbert.
+Copyright 1999-2000 Tom Gilbert <tom@linuxbrit.co.uk,
+                                  gilbertt@linuxbrit.co.uk,
+                                  scrot_sucks@linuxbrit.co.uk>
+Copyright 2009      James Cameron <quozl@us.netrek.org>
+Copyright 2010      Ibragimov Rinat <ibragimovrinat@mail.ru>
+Copyright 2017      Stoney Sauce <stoneysauce@gmail.com>
+Copyright 2019      Daniel T. Borelli <danieltborelli@gmail.com>
+Copyright 2019      Jade Auer <jade@trashwitch.dev>
+Copyright 2019      Matt Malone <m_j_malone@hotmail.com>
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to
@@ -36,6 +43,11 @@ main(int argc,
   Imlib_Load_Error err;
   char *filename_im = NULL, *filename_thumb = NULL;
 
+  char *have_extension = NULL;
+
+  clockid_t clock_id;   
+  struct timespec tsn;  /* time seconds and nanoseconds */
+
   time_t t;
   struct tm *tm;
 
@@ -46,16 +58,19 @@ main(int argc,
   if (!opt.output_file) {
     opt.output_file = gib_estrdup("%Y-%m-%d-%H%M%S_$wx$h_scrot.png");
     opt.thumb_file = gib_estrdup("%Y-%m-%d-%H%M%S_$wx$h_scrot-thumb.png");
+  } else {
+    have_extension = scrot_have_file_extension(opt.output_file);
   }
 
 
   if (opt.focused)
     image = scrot_grab_focused();
-  else if (opt.window)
-    image = scrot_grab_window();
   else if (opt.select)
     image = scrot_sel_and_grab_image();
-  else {
+  else if (opt.autoselect)
+    image = gib_imlib_create_image_from_drawable(root, 0, opt.autoselect_x, opt.autoselect_y, opt.autoselect_w, opt.autoselect_h, 1);
+  else
+  {
     scrot_do_delay();
     if (opt.multidisp) {
       image = scrot_grab_shot_multi();
@@ -64,19 +79,46 @@ main(int argc,
     }
   }
 
+  if (opt.note != NULL)
+    scrot_note_draw(image);
+
   if (!image)
     gib_eprintf("no image grabbed");
 
-  time(&t); /* Get the time directly after the screenshot */
-  tm = localtime(&t);
+  /* Old Style Time lacked decimal seconds ! */                     
+  /* Reasoning: for dynamic stuff on the screen that cannot 
+     be downloaded and run through a video editor, if 
+     physics computations are to be attempted then one
+     needs better time resolution than integer seconds.  
+     So I have added the bash date option %N for nano seconds. 
+                                     - Matt Malone  */
+  /* time(&t);  Old style of getting time, without nanoseconds */  
 
+  clock_id = CLOCK_REALTIME;                              
+  if (clock_gettime(clock_id, &tsn )==-1) 
+  {
+    fprintf(stderr, "clock_gettime returned -1\n");
+    exit(EXIT_FAILURE);
+  }
+  t = tsn.tv_sec;                                         
+
+  tm = localtime(&t);                                     
+
+  
   imlib_context_set_image(image);
   imlib_image_attach_data_value("quality", NULL, opt.quality, NULL);
 
-  filename_im = im_printf(opt.output_file, tm, NULL, NULL, image);
+  if (!have_extension) {
+    imlib_image_set_format("png");
+  }
+
+  filename_im = im_printf(opt.output_file, tm, tsn, NULL, NULL, image);   
+  scrot_check_if_overwrite_file(&filename_im);
+
   gib_imlib_save_image_with_error_return(image, filename_im, &err);
   if (err)
     gib_eprintf("Saving to file %s failed\n", filename_im);
+
   if (opt.thumb)
   {
     int cwidth, cheight;
@@ -117,14 +159,17 @@ main(int argc,
       gib_eprintf("Unable to create scaled Image\n");
     else
     {
-      filename_thumb = im_printf(opt.thumb_file, tm, NULL, NULL, thumbnail);
+      if (opt.note != NULL)
+        scrot_note_draw(image);
+      filename_thumb = im_printf(opt.thumb_file, tm, tsn, NULL, NULL, thumbnail);  
+      scrot_check_if_overwrite_file(&filename_thumb);
       gib_imlib_save_image_with_error_return(thumbnail, filename_thumb, &err);
       if (err)
         gib_eprintf("Saving thumbnail %s failed\n", filename_thumb);
     }
   }
   if (opt.exec)
-    scrot_exec_app(image, tm, filename_im, filename_thumb);
+    scrot_exec_app(image, tm, tsn, filename_im, filename_thumb);
   gib_imlib_free_image_and_decache(image);
 
   return 0;
@@ -152,65 +197,158 @@ scrot_do_delay(void)
   }
 }
 
+char* scrot_have_file_extension(char *filename)
+{
+    char *ext = strrchr(filename, '.');
+    return (ext && (strlen(ext + 1) == 3)) ? ext : NULL;
+}
+
+void scrot_check_if_overwrite_file(char **filename)
+{
+  char *curfile = *filename;
+
+  if (opt.overwrite == 1) return;
+
+  if (access(curfile, F_OK) == -1) return;
+
+  const int max_count = 999;
+  static int count = 0;
+  const char *extension = scrot_have_file_extension(curfile);
+  const size_t slen = strlen(curfile);
+  int nalloc = slen + 4 + 1; // _000 + NUL byte
+  char fmt[5];
+  char *newname = NULL;
+
+  if (extension)
+    nalloc += 4; // .ext
+
+  newname = calloc(nalloc, sizeof(char));
+
+  if (extension)
+    // exclude extension
+    memcpy(newname, curfile, slen - 4);
+  else
+    memcpy(newname, curfile, slen);
+
+  do {
+    snprintf(fmt, 5, "_%03d", count++);
+
+    if (!extension) {
+      strncpy(newname + slen, fmt, 5);
+    } else {
+        strncpy((newname + slen)-4, fmt, 5);
+        strncat(newname, extension, 4);
+    }
+      curfile = newname;
+  } while ((count < max_count) && (access(curfile, F_OK) == 0));
+
+  free(*filename);
+  *filename = newname;
+
+  if (count == max_count) {
+    fprintf(stderr, "scrot can no longer generate new file names.\n"
+                    "The last attempt is %s\n", newname);
+    free(newname);
+    exit(EXIT_FAILURE);
+  }
+}
+
+
+void
+scrot_grab_mouse_pointer(const Imlib_Image image,
+    const int ix_off, const int iy_off)
+{
+  XFixesCursorImage *xcim = XFixesGetCursorImage(disp);
+
+  const int width       = xcim->width;
+  const int height      = xcim->height;
+  const int x           = (xcim->x - xcim->xhot) - ix_off;
+  const int y           = (xcim->y - xcim->yhot) - iy_off;
+  DATA32 *pixels        = NULL;
+
+#ifdef __i386__
+  pixels = (DATA32*)xcim->pixels;
+#else
+  DATA32 data[width * height * 4];
+
+  for (size_t i = 0; i < (width * height); i++)
+    ((DATA32*)data)[i] = (DATA32)xcim->pixels[i];
+
+  pixels = data;
+#endif
+
+  Imlib_Image imcursor  = imlib_create_image_using_data(width, height, pixels);
+
+  XFree(xcim);
+
+  if (!imcursor) {
+     fprintf(stderr, "scrot_grab_mouse_pointer: Failed create image using data.");
+     exit(EXIT_FAILURE);
+  }
+
+  imlib_context_set_image(imcursor);
+  imlib_image_set_has_alpha(1);
+  imlib_context_set_image(image);
+  imlib_blend_image_onto_image(imcursor, 0, 0, 0, width, height, x, y, width, height);
+  imlib_context_set_image(imcursor);
+  imlib_free_image();
+}
+
+
 Imlib_Image
 scrot_grab_shot(void)
 {
   Imlib_Image im;
 
-  XBell(disp, 0);
+  if (! opt.silent) XBell(disp, 0);
+
   im =
     gib_imlib_create_image_from_drawable(root, 0, 0, 0, scr->width,
                                          scr->height, 1);
+  if (opt.pointer == 1)
+    scrot_grab_mouse_pointer(im, 0, 0);
+
   return im;
 }
 
 void
-scrot_exec_app(Imlib_Image image, struct tm *tm,
-               char *filename_im, char *filename_thumb)
+scrot_exec_app(Imlib_Image image, struct tm *tm, struct timespec tsn,
+               char *filename_im, char *filename_thumb)       
 {
   char *execstr;
-  int status;
+  int ret;
 
-  execstr = im_printf(opt.exec, tm, filename_im, filename_thumb, image);
-  status = system(execstr);
-  exit(WEXITSTATUS(status));
-}
+  execstr = im_printf(opt.exec, tm, tsn, filename_im, filename_thumb, image);   
 
-Imlib_Image
-scrot_grab_identified_window(Window target)
-{
-  Imlib_Image im = NULL;
-  int rx = 0, ry = 0, rw = 0, rh = 0;
-  Window client_window = None;
+  errno = 0;
 
-  if (!scrot_get_geometry(target, &client_window, &rx, &ry, &rw, &rh))
-    return NULL;
-  scrot_nice_clip(&rx, &ry, &rw, &rh);
-  if(opt.alpha)
-    im = scrot_grab_transparent_shot(disp, client_window, rx, ry, rw, rh);
-  else
-    im = gib_imlib_create_image_from_drawable(root, 0, rx, ry, rw, rh, 1);
-  return im;
+  ret = system(execstr);
+
+  if (ret == -1) {
+    fprintf(stderr, "The child process could not be created: %s\n", strerror(errno));
+  } else if (WEXITSTATUS(ret) == 127) {
+    fprintf(stderr, "scrot could not be executed the command: %s.\n", execstr);
+  }
+
+  exit(0);
 }
 
 Imlib_Image
 scrot_grab_focused(void)
 {
+  Imlib_Image im = NULL;
+  int rx = 0, ry = 0, rw = 0, rh = 0;
   Window target = None;
   int ignored;
 
   scrot_do_delay();
   XGetInputFocus(disp, &target, &ignored);
-  return scrot_grab_identified_window(target);
-}
-
-Imlib_Image
-scrot_grab_window(void)
-{
-  Window target = opt.window;
-
-  scrot_do_delay();
-  return scrot_grab_identified_window(target);
+  if (!scrot_get_geometry(target, &rx, &ry, &rw, &rh)) return NULL;
+  scrot_nice_clip(&rx, &ry, &rw, &rh);
+  im = gib_imlib_create_image_from_drawable(root, 0, rx, ry, rw, rh, 1);
+  if (opt.pointer == 1)
+	  scrot_grab_mouse_pointer(im, rx, ry);
+  return im;
 }
 
 Imlib_Image
@@ -224,41 +362,73 @@ scrot_sel_and_grab_image(void)
   int count = 0, done = 0;
   int rx = 0, ry = 0, rw = 0, rh = 0, btn_pressed = 0;
   int rect_x = 0, rect_y = 0, rect_w = 0, rect_h = 0;
-  Cursor cursor, cursor_nw, cursor_ne, cursor_se, cursor_sw;
+  Cursor cur_cross, cur_angle;
   Window target = None;
   GC gc;
   XGCValues gcval;
 
-  xfd = ConnectionNumber(disp);
-  fdsize = xfd + 1;
-
-  cursor    = XCreateFontCursor(disp, XC_crosshair);
-  cursor_nw = XCreateFontCursor(disp, XC_ul_angle);
-  cursor_ne = XCreateFontCursor(disp, XC_ur_angle);
-  cursor_se = XCreateFontCursor(disp, XC_lr_angle);
-  cursor_sw = XCreateFontCursor(disp, XC_ll_angle);
-
-  gcval.foreground = XWhitePixel(disp, 0);
   gcval.function = GXxor;
+  gcval.foreground = XWhitePixel(disp, 0);
   gcval.background = XBlackPixel(disp, 0);
   gcval.plane_mask = gcval.background ^ gcval.foreground;
   gcval.subwindow_mode = IncludeInferiors;
+
+  if (opt.line_color != NULL) {
+    XColor clr_exact, clr_closest;
+    Status ret;
+
+    ret = XAllocNamedColor(disp, XDefaultColormap(disp, DefaultScreen(disp)),
+            opt.line_color, &clr_exact, &clr_closest);
+
+    if (ret == 0) {
+       free(opt.line_color);
+       fprintf(stderr, "Error allocate color:%s\n", strerror(BadColor));
+       exit(EXIT_FAILURE);
+    }
+
+    gcval.foreground = clr_exact.pixel;
+
+    free(opt.line_color);
+    opt.line_color = NULL;
+  }
+
+  xfd = ConnectionNumber(disp);
+  fdsize = xfd + 1;
+
+  cur_cross = XCreateFontCursor(disp, XC_cross);
+  cur_angle = XCreateFontCursor(disp, XC_lr_angle);
 
   gc =
     XCreateGC(disp, root,
               GCFunction | GCForeground | GCBackground | GCSubwindowMode,
               &gcval);
 
+  XSetLineAttributes(disp, gc, opt.line_width, opt.line_style, CapRound, JoinRound);
+
   if ((XGrabPointer
        (disp, root, False,
         ButtonMotionMask | ButtonPressMask | ButtonReleaseMask, GrabModeAsync,
-        GrabModeAsync, root, cursor, CurrentTime) != GrabSuccess))
-    gib_eprintf("couldn't grab pointer:");
+        GrabModeAsync, root, cur_cross, CurrentTime) != GrabSuccess)) {
+    fprintf(stderr, "couldn't grab pointer:");
+    XFreeCursor(disp, cur_cross);
+    XFreeCursor(disp, cur_angle);
+    XFreeGC(disp, gc);
+    exit(EXIT_FAILURE);
+  }
+
 
   if ((XGrabKeyboard
        (disp, root, False, GrabModeAsync, GrabModeAsync,
-        CurrentTime) != GrabSuccess))
-    gib_eprintf("couldn't grab keyboard:");
+        CurrentTime) != GrabSuccess)) {
+    fprintf(stderr, "couldn't grab keyboard:");
+    XFreeCursor(disp, cur_cross);
+    XFreeCursor(disp, cur_angle);
+    XFreeGC(disp, gc);
+    exit(EXIT_FAILURE);
+  }
+
+  if (opt.freeze == 1)
+      XGrabServer(disp);
 
   while (1) {
     /* handle events here */
@@ -270,6 +440,11 @@ scrot_sel_and_grab_image(void)
             if (rect_w) {
               /* re-draw the last rect to clear it */
               XDrawRectangle(disp, root, gc, rect_x, rect_y, rect_w, rect_h);
+            } else {
+              /* Change the cursor to show we're selecting a region */
+              XChangeActivePointerGrab(disp,
+                                       ButtonMotionMask | ButtonReleaseMask,
+                                       cur_angle, CurrentTime);
             }
 
             rect_x = rx;
@@ -277,23 +452,8 @@ scrot_sel_and_grab_image(void)
             rect_w = ev.xmotion.x - rect_x;
             rect_h = ev.xmotion.y - rect_y;
 
-            /* Change the cursor to show we're selecting a region */
-            if (rect_w < 0 && rect_h < 0)
-              XChangeActivePointerGrab(disp,
-                                       ButtonMotionMask | ButtonReleaseMask,
-                                       cursor_nw, CurrentTime);
-            else if (rect_w < 0 && rect_h > 0)
-              XChangeActivePointerGrab(disp,
-                                       ButtonMotionMask | ButtonReleaseMask,
-                                       cursor_sw, CurrentTime);
-            else if (rect_w > 0 && rect_h < 0)
-              XChangeActivePointerGrab(disp,
-                                       ButtonMotionMask | ButtonReleaseMask,
-                                       cursor_ne, CurrentTime);
-            else if (rect_w > 0 && rect_h > 0)
-              XChangeActivePointerGrab(disp,
-                                       ButtonMotionMask | ButtonReleaseMask,
-                                       cursor_se, CurrentTime);
+            if (rect_w == 0) ++rect_w;
+            if (rect_h == 0) ++rect_h;
 
             if (rect_w < 0) {
               rect_x += rect_w;
@@ -341,8 +501,10 @@ scrot_sel_and_grab_image(void)
     errno = 0;
     count = select(fdsize, &fdset, NULL, NULL, NULL);
     if ((count < 0)
-        && ((errno == ENOMEM) || (errno == EINVAL) || (errno == EBADF)))
-      gib_eprintf("Connection to X display lost");
+        && ((errno == ENOMEM) || (errno == EINVAL) || (errno == EBADF))) {
+      fprintf(stderr, "Connection to X display lost");
+      exit(EXIT_FAILURE);
+    }
   }
   if (rect_w) {
     XDrawRectangle(disp, root, gc, rect_x, rect_y, rect_w, rect_h);
@@ -350,16 +512,16 @@ scrot_sel_and_grab_image(void)
   }
   XUngrabPointer(disp, CurrentTime);
   XUngrabKeyboard(disp, CurrentTime);
-  XFreeCursor(disp, cursor);
+  XFreeCursor(disp, cur_cross);
+  XFreeCursor(disp, cur_angle);
   XFreeGC(disp, gc);
   XSync(disp, True);
 
+  if (opt.freeze == 1)
+      XUngrabServer(disp);
 
   if (done < 2) {
     scrot_do_delay();
-
-    Window client_window = None;
-
     if (rect_w > 5) {
       /* if a rect has been drawn, it's an area selection */
       rw = ev.xbutton.x - rx;
@@ -375,27 +537,25 @@ scrot_sel_and_grab_image(void)
       }
     } else {
       /* else it's a window click */
-      if (!scrot_get_geometry(target, &client_window, &rx, &ry, &rw, &rh))
-        return NULL;
+      if (!scrot_get_geometry(target, &rx, &ry, &rw, &rh)) return NULL;
     }
     scrot_nice_clip(&rx, &ry, &rw, &rh);
 
-    XBell(disp, 0);
-    if(opt.alpha)
-      im = scrot_grab_transparent_shot(disp, client_window, rx, ry, rw, rh);
-    else
-      im = gib_imlib_create_image_from_drawable(root, 0, rx, ry, rw, rh, 1);
+    if (! opt.silent) XBell(disp, 0);
+    im = gib_imlib_create_image_from_drawable(root, 0, rx, ry, rw, rh, 1);
+
+    if (opt.pointer == 1)
+       scrot_grab_mouse_pointer(im, rx, ry);
   }
   return im;
 }
 
-
 /* clip rectangle nicely */
 void
 scrot_nice_clip(int *rx, 
-		int *ry, 
-		int *rw, 
-		int *rh)
+  int *ry,
+  int *rw,
+  int *rh)
 {
   if (*rx < 0) {
     *rw += *rx;
@@ -411,58 +571,41 @@ scrot_nice_clip(int *rx,
     *rh = scr->height - *ry;
 }
 
-
 /* get geometry of window and use that */
 int
 scrot_get_geometry(Window target,
-                   Window *client_window,
-                   int *rx, 
-                   int *ry, 
-                   int *rw, 
-                   int *rh)
+		   int *rx, 
+		   int *ry, 
+		   int *rw, 
+		   int *rh)
 {
   Window child;
   XWindowAttributes attr;
   int stat;
 
-  /* Get window manager frame and detect application window     */
-  /* from pointed window.                                       */
+  /* get windowmanager frame of window */
   if (target != root) {
-    int x;
     unsigned int d;
+    int x;
     int status;
     
     status = XGetGeometry(disp, target, &root, &x, &x, &d, &d, &d, &d);
     if (status != 0) {
       Window rt, *children, parent;
       
-      /* Find toplevel window.                                  */
-      /* It will have coordinates of window, that we look for   */
-      /* But it may be completely different window (it depends  */
-      /* on window manager).                                    */
       for (;;) {
-        status = XQueryTree(disp, target, &rt, &parent, &children, &d);
-        if (status && (children != None))
-          XFree((char *) children);
-        if (!status || (parent == None) || (parent == rt))
-          break;
-        target = parent;
+	/* Find window manager frame. */
+	status = XQueryTree(disp, target, &rt, &parent, &children, &d);
+	if (status && (children != None))
+	  XFree((char *) children);
+	if (!status || (parent == None) || (parent == rt))
+	  break;
+	target = parent;
       }
-
       /* Get client window. */
-      if (opt.border)
-      {
-        *client_window = scrot_get_client_window(disp, target);
-        target = scrot_get_net_frame_window(disp, target);
-      }
-      else
-      {
-        target = scrot_get_client_window(disp, target);
-        *client_window = target;
-      }
-
+      if (!opt.border)
+	target = scrot_get_client_window(disp, target);
       XRaiseWindow(disp, target);
-      XSetInputFocus(disp, target, RevertToParent, CurrentTime);
     }
   }
   stat = XGetWindowAttributes(disp, target, &attr);
@@ -471,109 +614,8 @@ scrot_get_geometry(Window target,
   *rw = attr.width;
   *rh = attr.height;
   XTranslateCoordinates(disp, target, root, 0, 0, rx, ry, &child);
-
-  // additional border for shadows:
-  // FIXME apply only if grabbing transparent screenshot
-  // and not maximised nor fullscreen
-  if(opt.alpha)
-  {
-    *rx -= 20;
-    *ry -= 20;
-    *rw += 40;
-    *rh += 40;
-  }
-
   return 1;
 }
-
-
-Imlib_Image
-scrot_grab_transparent_shot(Display *dpy, 
-                            Window client_window,
-                            int x,
-                            int y,
-                            int width,
-                            int height)
-{
-  Imlib_Image black_shot, white_shot;
-
-  Window w = scrot_create_window(dpy, x, y, width, height);
-  
-  XSetInputFocus(dpy, client_window, RevertToParent, CurrentTime);
-
-  // compiz raises window as expected
-  // metacity have problems, so we need
-  // to set always-on-top flag temporarily for metacity
-  // FIXME 
-  //
-  // XRaiseWindow(dpy, client_window);
-  window_set_above(dpy, client_window, 1);
-
-  XFlush(dpy);
-  // wait 1s until WM will finish animations
-  sleep(1); // FIXME try to disable animations for this window
-  white_shot = gib_imlib_create_image_from_drawable(root,
-      0, x, y, width, height, 1);
-
-  GC gc = XCreateGC(dpy, w, 0, 0);
-  XFillRectangle(dpy, w, gc, 0, 0, width, height);
-  XFlush(dpy);
-  sleep(1); // FIXME
-  black_shot = gib_imlib_create_image_from_drawable(root,
-      0, x, y, width, height, 1);
-
-  window_set_above(dpy, client_window, 0);
-  XFlush(dpy);
-
-  return create_transparent_image(white_shot, black_shot);
-}
-
-
-Window
-scrot_create_window(Display *dpy, 
-                    int x,
-                    int y,
-                    int width,
-                    int height)
-{
-  Window w = XCreateSimpleWindow(dpy, DefaultRootWindow(dpy), x, y, 
-         width, height, 0, 
-         XBlackPixel(disp, 0),
-         XWhitePixel(disp, 0));
-  XSelectInput(dpy, w, PropertyChangeMask | StructureNotifyMask
-      | SubstructureRedirectMask | ConfigureRequest  /* | ExposureMask */ );
-
-  struct {
-    unsigned long flags;
-    unsigned long functions;
-    unsigned long decorations;
-    long input_mode;
-    unsigned long status;
-  } hints = { 2, 1, 0, 0, 0 };
-
-  // _MOTIF_WM_HINTS is respected by most window managers
-  // but freedesktop intends to deprecate it
-  // replace with _NET_WM_WINDOW_TYPE_DESKTOP ?
-  XChangeProperty (dpy, w,
-    XInternAtom (dpy, "_MOTIF_WM_HINTS", False),
-    XInternAtom (dpy, "_MOTIF_WM_HINTS", False),
-    32, PropModeReplace,
-    (const unsigned char *) &hints,
-    sizeof (hints) / sizeof (long));
-
-  window_set_skip_taskbar(dpy, w);
- 
-  XMapWindow(dpy, w);
-  XMoveWindow(dpy, w, x, y);
-  for(;;) {
-    XEvent e;
-    XNextEvent(dpy, &e);
-    if (e.type == MapNotify)
-      break;
-  }
-  return w;
-}
-
 
 Window
 scrot_get_window(Display * display,
@@ -609,10 +651,10 @@ scrot_get_window(Display * display,
 
 
 char *
-im_printf(char *str, struct tm *tm,
+im_printf(char *str, struct tm *tm, struct timespec tsn,
           char *filename_im,
           char *filename_thumb,
-          Imlib_Image im)
+          Imlib_Image im)             
 {
   char *c;
   char buf[20];
@@ -622,12 +664,33 @@ im_printf(char *str, struct tm *tm,
   struct stat st;
 
   ret[0] = '\0';
-  strftime(strf, 4095, str, tm);
 
-  for (c = strf; *c != '\0'; c++) {
-    if (*c == '$') {
+  if (strftime(strf, 4095, str, tm) == 0) {
+    fprintf(stderr,"strftime returned 0\n");
+    exit(EXIT_FAILURE);
+  }
+
+  for (c = strf; *c != '\0'; c++) {    
+    if (*c == '%') {              
+      c++;
+      if (*c == 'N') {
+        snprintf(buf, sizeof(buf), "%09ld", tsn.tv_nsec);
+        strcat(ret, buf);
+        
+      } else {
+        const size_t len = strlen(ret);
+        ret[len] = '%';
+        ret[len + 1] = *c;
+        ret[len + 2] = '\0';        
+      }
+
+    } else if (*c == '$') {   
       c++;
       switch (*c) {
+        case 'a':
+          gethostname(buf, sizeof(buf));
+          strcat(ret, buf);
+          break;
         case 'f':
           if (filename_im)
             strcat(ret, filename_im);
@@ -672,7 +735,10 @@ im_printf(char *str, struct tm *tm,
           strcat(ret, buf);
           break;
         case 't':
-          strcat(ret, gib_imlib_image_format(im));
+          tmp = gib_imlib_image_format(im);
+          if (tmp) {
+            strcat(ret, gib_imlib_image_format(im));
+          }
           break;
         case '$':
           strcat(ret, "$");
@@ -692,8 +758,11 @@ im_printf(char *str, struct tm *tm,
           strncat(ret, c, 1);
           break;
       }
-    } else
-      strncat(ret, c, 1);
+    } else {
+      const size_t len = strlen(ret);
+      ret[len] = *c;
+      ret[len + 1] = '\0';
+    }
   }
   return gib_estrdup(ret);
 }
@@ -722,34 +791,6 @@ scrot_get_client_window(Display * display,
   if (!client)
     return target;
   return client;
-}
-
-Window
-scrot_get_net_frame_window(Display * display,
-                           Window target)
-{
-  /* window's _NET_FRAME_WINDOW property       */
-  /* points to window decoration frame xid     */
-  /* it's useful for WMs, that do not reparent */
-  /* client window to decoration windows       */
-  /* (e.g. compiz <= 0.9)                      */
-  Atom net_frame;
-  Atom type = None;
-  int format, status;
-  unsigned char *data;
-  unsigned long after, items;
-  net_frame = XInternAtom(display, "_NET_FRAME_WINDOW", True);
-  if (None == net_frame)
-    return target;
-  status = XGetWindowProperty(display, target, net_frame, 0L, 1L, False,
-                         (Atom) AnyPropertyType, &type, &format,
-                         &items, &after, &data);
-  if (Success!=status || None==type || 32!=format || 1!=items)
-    return target;
-  target = *(Window*)data;
-  if (data)
-    XFree(data);
-  return target;
 }
 
 Window
@@ -862,71 +903,3 @@ stalk_image_concat(gib_list * images)
   }
   return ret;
 }
-
-
-Imlib_Image
-create_transparent_image(Imlib_Image w_image, Imlib_Image b_image)
-{
-  int w, h;
-  DATA32 *dst_data, *src_data;
-  imlib_context_set_image(w_image);
-  dst_data = imlib_image_get_data();
-  imlib_context_set_image(b_image);
-  src_data = imlib_image_get_data();
-  h = gib_imlib_image_get_height(w_image);
-  w = gib_imlib_image_get_width(w_image);
-
-  unsigned long i;
-  for(i=0; i<w*h; i++)
-    if(dst_data[i] != src_data[i])
-    {
-      DATA32 alpha;
-      alpha = (src_data[i] & 0xff) - (dst_data[i] & 0xff);
-      alpha = (alpha << 24) & 0xff000000;
-      dst_data[i] = (src_data[i] & 0xffffff) | alpha;
-    }
-  Imlib_Image ret_img;
-  ret_img = imlib_create_image_using_data(w, h, dst_data);
-  imlib_context_set_image(ret_img);
-  imlib_image_set_has_alpha(1);
-  return ret_img;
-}
-
-
-void
-window_set_skip_taskbar(Display *dpy, Window window)
-{
-  XEvent event;
-  event.xclient.type = ClientMessage;
-  event.xclient.display = dpy;
-  event.xclient.window = window;
-  event.xclient.message_type = XInternAtom(dpy, "_NET_WM_STATE", True);
-  event.xclient.format = 32;
-  event.xclient.data.l[0] = 1;
-  event.xclient.data.l[1] = XInternAtom(dpy, "_NET_WM_STATE_SKIP_TASKBAR", True);
-  event.xclient.data.l[2] = 0;
-  event.xclient.data.l[3] = 0;
-  event.xclient.data.l[4] = 0;
-
-  XSendEvent(dpy, DefaultRootWindow(disp), True, PropertyChangeMask, &event);
-}
-
-
-void
-window_set_above(Display *dpy, Window window, int enable)
-{
-  XEvent event;
-  event.xclient.type = ClientMessage;
-  event.xclient.display = dpy;
-  event.xclient.window = window;
-  event.xclient.message_type = XInternAtom(dpy, "_NET_WM_STATE", True);
-  event.xclient.format = 32;
-  event.xclient.data.l[0] = enable;
-  event.xclient.data.l[1] = XInternAtom(dpy, "_NET_WM_STATE_ABOVE", True);
-  event.xclient.data.l[2] = 0;
-  event.xclient.data.l[3] = 0;
-  event.xclient.data.l[4] = 0;
-
-  XSendEvent(dpy, DefaultRootWindow(disp), True, PropertyChangeMask, &event);
-}
-
